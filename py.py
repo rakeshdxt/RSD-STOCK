@@ -1,88 +1,102 @@
-import yfinance as yf
 import requests
-from bs4 import BeautifulSoup
 import pandas as pd
 import time
-import os
-from datetime import datetime
+import threading
+from flask import Flask, send_file
 
-# --- CONFIGURATION ---
-MARKET_CAP_LIMIT = 1000 * 10**7 
-ROE_LIMIT = 0.15                
-MASTER_LIST = "List_Securities.csv" 
-OUTPUT_FILE = "xbrl_fundamental_records.csv"
-STATE_FILE = "last_index.txt"
-BATCH_SIZE = 50                 # Process 50 stocks per run
+app = Flask(__name__)
 
-def get_last_index():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
-            return int(f.read().strip())
-    return 0
+CSV_FILE = "nse_data.csv"
+progress = {"status":"Idle","percent":0}
 
-def save_last_index(index):
-    with open(STATE_FILE, "w") as f:
-        f.write(str(index))
+# -------- MULTIBAGGER + AI SCORE ----------
+def calculate_scores(row):
+    score = 0
 
-def get_metrics(ticker_symbol):
-    try:
-        t = yf.Ticker(ticker_symbol)
-        info = t.info
-        return {"m_cap": info.get('marketCap', 0), "roe": info.get('returnOnEquity', 0)}
-    except:
-        return {"m_cap": 0, "roe": 0}
+    if row["roe"] > 15: score += 20
+    if row["roce"] > 18: score += 20
+    if row["de"] < 0.5: score += 15
+    if row["promoter"] > 50: score += 15
+    if row["growth"] > 10: score += 15
+    if row["pb"] < 3: score += 15
 
-def fetch_xbrl_profit(scrip):
-    url = f"https://www.bseindia.com/stock-share-price/xbrl/getxbrlfile.aspx?scripcode={scrip}"
-    try:
-        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
-        if r.status_code == 200 and len(r.content) > 1000:
-            soup = BeautifulSoup(r.content, 'xml')
-            return soup.find(['ProfitLossForPeriod', 'NetProfit']).text if soup.find(['ProfitLossForPeriod', 'NetProfit']) else "0"
-    except:
-        return None
+    probability = min(score,100)
+    return probability, score
 
-def main():
-    df_master = pd.read_csv(MASTER_LIST)
-    all_codes = df_master.to_dict('records')
-    
-    start = get_last_index()
-    # Reset if we reached the end of the file
-    if start >= len(all_codes):
-        start = 0
-    
-    end = start + BATCH_SIZE
-    batch = all_codes[start:end]
-    
-    results = []
-    print(f"--- Starting Batch: {start} to {min(end, len(all_codes))} ---")
 
-    for i, row in enumerate(batch):
-        scrip_code = row['Scrip Code']
-        ticker = f"{str(row['Scrip Id']).strip()}.BO"
+# -------- FETCH DATA ----------
+def fetch_data():
 
-        metrics = get_metrics(ticker)
-        if metrics['m_cap'] >= MARKET_CAP_LIMIT and metrics['roe'] >= ROE_LIMIT:
-            profit = fetch_xbrl_profit(scrip_code)
-            if profit:
-                results.append({
-                    "Date": datetime.now().strftime("%Y-%m-%d"),
-                    "Scrip": scrip_code,
-                    "Symbol": ticker,
-                    "ROE": f"{metrics['roe']*100:.2f}%",
-                    "M-Cap_Cr": round(metrics['m_cap']/10**7, 2),
-                    "Profit": profit
-                })
-                print(f"✅ Match: {ticker}")
-        
-        time.sleep(1) # Be gentle with servers
+    progress["status"]="Fetching"
+    symbols = ["RELIANCE","TCS","INFY","HDFCBANK","ITC"]   # add more stocks here
 
-    # Update state and save
-    save_last_index(end)
-    if results:
-        pd.DataFrame(results).to_csv(OUTPUT_FILE, mode='a', index=False, header=not os.path.exists(OUTPUT_FILE))
-    
-    print(f"--- Batch Finished. Next start index: {end} ---")
+    rows=[]
+    total=len(symbols)
 
-if __name__ == "__main__":
-    main()
+    for i,symbol in enumerate(symbols):
+
+        url=f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbol}.NS"
+        r=requests.get(url).json()
+        q=r["quoteResponse"]["result"][0]
+
+        row={
+            "stock":symbol,
+            "price":q.get("regularMarketPrice",0),
+            "eps":q.get("epsTrailingTwelveMonths",0),
+            "growth":0,
+            "mcap":q.get("marketCap",0)/10000000,
+            "promoter":50,
+            "pledged":0,
+            "cfo":0,
+            "netprofit":0,
+            "roa":0,
+            "roce":0,
+            "roe":0,
+            "pb":q.get("priceToBook",0),
+            "de":0
+        }
+
+        prob,score=calculate_scores(row)
+        row["multibagger_probability"]=prob
+        row["ai_score"]=score
+
+        rows.append(row)
+
+        progress["percent"]=int((i+1)/total*100)
+        time.sleep(2)
+
+    df=pd.DataFrame(rows)
+    df.to_csv(CSV_FILE,index=False)
+    progress["status"]="Done"
+
+
+# -------- SCHEDULER ----------
+def scheduler():
+    while True:
+        t=time.strftime("%H:%M")
+        if t in ["09:00","21:00"]:
+            fetch_data()
+            time.sleep(60)
+        time.sleep(20)
+
+threading.Thread(target=scheduler,daemon=True).start()
+
+
+# -------- API ROUTES ----------
+@app.route("/")
+def download():
+    return send_file(CSV_FILE,as_attachment=True)
+
+@app.route("/progress")
+def prog():
+    return progress
+
+@app.route("/run-now")
+def runnow():
+    threading.Thread(target=fetch_data).start()
+    return {"status":"Started"}
+
+
+# -------- START SERVER ----------
+if __name__=="__main__":
+    app.run(host="0.0.0.0",port=10000)
